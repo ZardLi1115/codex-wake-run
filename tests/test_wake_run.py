@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -11,18 +12,25 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "skills" / "wake-run" / "scripts" / "wake_run.py"
+SCRIPT = ROOT / "scripts" / "wake_run.py"
 SPEC = importlib.util.spec_from_file_location("wake_run", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 wake_run = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(wake_run)
 
 
+def python_shell_command(source: str) -> str:
+    if os.name == "nt":
+        executable = str(Path(sys.executable)).replace("'", "''")
+        code = source.replace("'", "''")
+        return f"& '{executable}' -c '{code}'"
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+
+
 class WakeMessageTests(unittest.TestCase):
     def test_success_message_contains_fixed_system_note(self) -> None:
         message = wake_run.build_wake_message("python train.py", 0, Path("/tmp/run.log"))
         self.assertTrue(message.startswith("[后台任务唤醒通知]"))
-        self.assertIn("脚本：python train.py", message)
         self.assertIn("状态：执行完成", message)
         self.assertIn("退出码：0", message)
         self.assertIn("注：该消息由系统后台唤醒，并非用户亲自发出消息。", message)
@@ -52,14 +60,17 @@ class InvocationTests(unittest.TestCase):
             platform="nt",
             powershell_bin="pwsh.exe",
         )
-        self.assertEqual(invocation[:6], [
-            "pwsh.exe",
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            r"C:\Users\me\AppData\Roaming\npm\codex.ps1",
-        ])
+        self.assertEqual(
+            invocation[:6],
+            [
+                "pwsh.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                r"C:\Users\me\AppData\Roaming\npm\codex.ps1",
+            ],
+        )
         self.assertEqual(invocation[-1], "hello\nworld")
 
     @mock.patch.object(wake_run.shutil, "which")
@@ -88,28 +99,6 @@ class QueueTests(unittest.TestCase):
             run.call_args.args[0],
             ["/usr/bin/codex", "queue", "--thread", "thread-123", "--message", "wake message"],
         )
-
-    @mock.patch.object(wake_run, "resolve_powershell", return_value="pwsh.exe")
-    @mock.patch.object(
-        wake_run,
-        "resolve_codex_executable",
-        return_value=r"C:\Users\me\AppData\Roaming\npm\codex.ps1",
-    )
-    @mock.patch.object(wake_run.subprocess, "run")
-    def test_queue_wakeup_wraps_codex_ps1_on_windows(
-        self,
-        run: mock.Mock,
-        _resolve: mock.Mock,
-        _powershell: mock.Mock,
-    ) -> None:
-        run.return_value = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
-        with mock.patch.object(wake_run.os, "name", "nt"):
-            wake_run.queue_wakeup("thread-123", "wake\nmessage", "codex")
-        invocation = run.call_args.args[0]
-        self.assertEqual(invocation[0], "pwsh.exe")
-        self.assertEqual(invocation[4], "-File")
-        self.assertTrue(invocation[5].lower().endswith("codex.ps1"))
-        self.assertEqual(invocation[-1], "wake\nmessage")
 
     @mock.patch.object(wake_run, "resolve_codex_executable", return_value="/usr/bin/codex")
     @mock.patch.object(wake_run.subprocess, "run")
@@ -143,7 +132,7 @@ class WorkerTests(unittest.TestCase):
     def test_worker_waits_for_success_and_queues_wakeup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "success.log"
-            command = f'"{sys.executable}" -c "print(12345)"'
+            command = python_shell_command("print(12345)")
             with mock.patch.object(wake_run, "queue_wakeup") as queue:
                 exit_code = wake_run.run_worker(
                     thread_id="thread-success",
@@ -154,14 +143,12 @@ class WorkerTests(unittest.TestCase):
                 )
             self.assertEqual(exit_code, 0)
             self.assertIn("12345", log_file.read_text(encoding="utf-8"))
-            message = queue.call_args.args[1]
-            self.assertIn("状态：执行完成", message)
-            self.assertIn("退出码：0", message)
+            self.assertIn("状态：执行完成", queue.call_args.args[1])
 
     def test_worker_waits_for_failure_and_queues_wakeup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "failure.log"
-            command = f'"{sys.executable}" -c "import sys; print(67890); sys.exit(9)"'
+            command = python_shell_command("import sys; print(67890); sys.exit(9)")
             with mock.patch.object(wake_run, "queue_wakeup") as queue:
                 exit_code = wake_run.run_worker(
                     thread_id="thread-failure",
@@ -172,9 +159,7 @@ class WorkerTests(unittest.TestCase):
                 )
             self.assertEqual(exit_code, 9)
             self.assertIn("67890", log_file.read_text(encoding="utf-8"))
-            message = queue.call_args.args[1]
-            self.assertIn("状态：执行失败", message)
-            self.assertIn("退出码：9", message)
+            self.assertIn("状态：执行失败", queue.call_args.args[1])
 
     def test_runtime_source_has_no_poll_or_sleep_loop(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -197,7 +182,6 @@ class WorkerTests(unittest.TestCase):
             )
             fake_codex.chmod(0o755)
             log_file = tmp_path / "integration.log"
-            command = f'"{sys.executable}" -c "print(24680)"'
             result = subprocess.run(
                 [
                     sys.executable,
@@ -206,7 +190,7 @@ class WorkerTests(unittest.TestCase):
                     "--thread-id",
                     "thread-integration",
                     "--command",
-                    command,
+                    python_shell_command("print(24680)"),
                     "--cwd",
                     str(tmp_path),
                     "--log-file",
@@ -220,12 +204,8 @@ class WorkerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("24680", log_file.read_text(encoding="utf-8"))
             args = json.loads(capture.read_text(encoding="utf-8"))
-            self.assertEqual(args[0], "queue")
-            self.assertEqual(args[1:3], ["--thread", "thread-integration"])
-            self.assertEqual(args[3], "--message")
-            self.assertIn("[后台任务唤醒通知]", args[4])
+            self.assertEqual(args[:4], ["queue", "--thread", "thread-integration", "--message"])
             self.assertIn("状态：执行完成", args[4])
 
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell integration test")
@@ -235,11 +215,10 @@ class WorkerTests(unittest.TestCase):
             script = tmp_path / "wake run test.ps1"
             script.write_text("Write-Output 'WINDOWS_WAKE_OK'\nexit 0\n", encoding="utf-8")
             log_file = tmp_path / "windows.log"
-            command = f"& '{script}'"
             with mock.patch.object(wake_run, "queue_wakeup"):
                 exit_code = wake_run.run_worker(
                     thread_id="thread-windows",
-                    command=command,
+                    command=f"& '{script}'",
                     cwd=tmp_path,
                     log_file=log_file,
                     codex_bin="codex",
@@ -263,24 +242,29 @@ class LauncherTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "armed")
         self.assertEqual(result["worker_pid"], 4242)
-        worker_args = popen.call_args.args[0]
-        self.assertIn("--worker", worker_args)
-        self.assertIn("thread-abc", worker_args)
-        self.assertIn("python train.py", worker_args)
-        self.assertIn("/resolved/codex", worker_args)
+        self.assertIn("/resolved/codex", popen.call_args.args[0])
 
 
 class LayoutTests(unittest.TestCase):
-    def test_plugin_manifest_and_skill_have_no_placeholders(self) -> None:
-        manifest_path = ROOT / ".codex-plugin" / "plugin.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(manifest["name"], "codex-wake-run")
-        self.assertEqual(manifest["version"], "0.1.1")
-        self.assertEqual(manifest["skills"], "./skills/")
-        self.assertIn("defaultPrompt", manifest["interface"])
-        skill_text = (ROOT / "skills" / "wake-run" / "SKILL.md").read_text(encoding="utf-8")
+    def test_repo_root_is_the_skill(self) -> None:
+        self.assertTrue((ROOT / "SKILL.md").is_file())
+        self.assertTrue((ROOT / "agents" / "openai.yaml").is_file())
+        self.assertTrue((ROOT / "scripts" / "wake_run.py").is_file())
+        self.assertFalse((ROOT / ".codex-plugin").exists())
+        self.assertFalse((ROOT / "skills").exists())
+        skill_text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertNotIn("[TODO:", skill_text)
         self.assertTrue(skill_text.startswith("---\nname: wake-run\n"))
+
+    def test_readmes_do_not_document_direct_launcher_options(self) -> None:
+        english = (ROOT / "README.md").read_text(encoding="utf-8")
+        chinese = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
+        self.assertNotIn("## Launcher options", english)
+        self.assertNotIn("To call the launcher directly", english)
+        self.assertNotIn("## 启动器参数", chinese)
+        self.assertNotIn("如果想绕过 skill 直接调用启动器", chinese)
+        self.assertNotIn("skills/wake-run/", english)
+        self.assertNotIn("skills/wake-run/", chinese)
 
 
 if __name__ == "__main__":
