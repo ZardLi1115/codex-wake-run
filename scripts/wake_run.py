@@ -64,7 +64,15 @@ def build_experiment_invocation(command: str, *, platform: str | None = None, po
     platform = platform or os.name
     if platform == "nt":
         powershell_bin = powershell_bin or resolve_powershell()
-        return [powershell_bin, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+        wrapped = (
+            f"& {{ {command} }}; "
+            "$wakeRunOk = $?; "
+            "$wakeRunExit = $LASTEXITCODE; "
+            "if ($null -ne $wakeRunExit) { exit $wakeRunExit }; "
+            "if (-not $wakeRunOk) { exit 1 }; "
+            "exit 0"
+        )
+        return [powershell_bin, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapped]
     shell = os.environ.get("SHELL") or "/bin/sh"
     if not Path(shell).is_file():
         shell = "/bin/sh"
