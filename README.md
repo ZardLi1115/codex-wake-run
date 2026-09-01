@@ -1,6 +1,6 @@
-<h1 align="center">Codex Wake Run</h1>
+<h1 align="center">wake-run-skill</h1>
 
-<p align="center">A Codex plugin that runs long commands in a detached watcher and wakes the originating Codex thread when the process exits, so the model never polls for status.</p>
+<p align="center">A Codex skill that runs long commands in a detached watcher and wakes the originating Codex thread when the process exits, so the model never polls for status.</p>
 
 <p align="center">
   <a href="./README.md">English</a> | <a href="./README.zh-CN.md">简体中文</a>
@@ -12,7 +12,7 @@
 
 Long experiments create an awkward choice inside an agent session: either the model sits in a polling loop burning turns while it waits, or you lose the thread of the original task and have to re-explain it later.
 
-Codex Wake Run removes the wait. You hand it the finalized command; it spawns a detached watcher, prints `status: armed`, and the current turn ends right away. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher uses `codex queue` to inject a wake-up message back into the same thread that launched it, carrying the exit code and log path. The model picks the original task back up with its context intact.
+wake-run removes the wait. You hand it the finalized command; it spawns a detached watcher, prints `status: armed`, and the current turn ends right away. The watcher blocks on the operating system process-exit event. When the command finishes, succeeds or fails, the watcher uses `codex queue` to inject a wake-up message back into the same thread that launched it, carrying the exit code and log path. The model picks the original task back up with its context intact.
 
 ## Highlights
 
@@ -22,7 +22,7 @@ Codex Wake Run removes the wait. You hand it the finalized command; it spawns a 
 | The turn ends immediately | The launcher spawns a detached worker, prints one JSON line, and exits, so no model turn is spent waiting. |
 | Wakes the same thread | The watcher calls `codex queue --thread "$CODEX_THREAD_ID"`, so the continuation lands in the conversation that started the job, not a new one. |
 | Failures wake you too | A non-zero exit and a failed process launch both produce a wake-up message with the exit code, so a broken job does not simply go quiet. |
-| Windows and POSIX | Commands run through PowerShell on Windows and `/bin/sh` on POSIX, including `codex.ps1` shim handling. CI runs the suite on `ubuntu-latest` and `windows-latest`. |
+| Windows and POSIX | Commands run through PowerShell on Windows and `/bin/sh` on POSIX, including `codex.ps1` shim handling. Tests run on `ubuntu-latest` and `windows-latest`. |
 | One log per run | Each run streams stdout and stderr into `<cwd>/.codex-wake-run/<run_id>.log`, and the wake-up message names that exact file. |
 
 ## Architecture
@@ -61,20 +61,23 @@ The launcher verifies `codex queue` support before it starts anything, so an inc
 
 ## Usage Example
 
-Launch a training run from inside a Codex session, keeping your project as the working directory:
+A full round trip, as it actually plays out in a session.
 
-```bash
-python3 /path/to/codex-wake-run/skills/wake-run/scripts/wake_run.py \
-  --command 'echo "training started"; sleep 2; echo "done"'
+**You:**
+
+```text
+Use wake-run-skill to run this script for me.
 ```
 
-The launcher returns one line and exits:
+**Codex** launches the script and gets `armed` back from the launcher:
 
 ```json
 {"status": "armed", "run_id": "b7599ab35869", "worker_pid": 97153, "log_file": "/work/project/.codex-wake-run/b7599ab35869.log"}
 ```
 
-Once `status` is `armed`, the turn ends. Nothing polls the job. When the command exits, the watcher queues this message into the originating thread:
+It then stops reasoning and ends the turn. Nothing polls the job, no turns are spent waiting, and the session is free in the meantime.
+
+**Some time later**, the script exits and the watcher queues a wake-up into that same thread:
 
 ```text
 [后台任务唤醒通知]
@@ -91,7 +94,7 @@ Once `status` is `armed`, the turn ends. Nothing polls the job. When the command
 注：该消息由系统后台唤醒，并非用户亲自发出消息。
 ```
 
-The wake-up message is fixed in shape and always reports the command, status, exit code, and log path. On failure the status line reads `执行失败` and the exit code is the real non-zero code; if the process could not be launched at all, an `启动错误` line is appended. Meanwhile the log file holds the command line followed by its combined output:
+**Codex** treats this as a system continuation event rather than a new instruction, reads the named log if it needs detail, and carries on with the original task:
 
 ```text
 $ echo "training started"; sleep 2; echo "done"
@@ -99,46 +102,41 @@ training started
 done
 ```
 
-## Quick Install
-
-Clone the repository anywhere on the machine that runs Codex:
-
-```bash
-git clone https://github.com/ZardLi1115/codex-wake-run.git
-```
-
-There is nothing to build and there are no third-party dependencies; the watcher uses only the Python standard library. The skill lives at `skills/wake-run/`, and its launcher is invoked by absolute path, so the clone location is up to you.
+The wake-up message is fixed in shape and always reports the command, status, exit code, and log path. On failure the status line reads `执行失败` and the exit code is the real non-zero code; if the process could not be launched at all, an `启动错误` line is appended. Either way the thread wakes, so Codex can diagnose the failure and relaunch instead of leaving you to notice the silence.
 
 ## Quick Start
 
-wake-run only works from inside a Codex session, because it needs the thread it is supposed to wake.
+Both steps are things you say to Codex. There is nothing to build and no third-party dependency; the watcher uses only the Python standard library.
 
-1. **Confirm your Codex CLI supports `codex queue`.** The launcher preflights this and refuses to start otherwise:
+**1. Install the skill.** Ask your Codex to do it:
 
-   ```bash
-   codex queue --help
-   ```
+```text
+Install the wake-run skill for me: https://github.com/ZardLi1115/codex-wake-run
+```
 
-2. **Ask Codex to use the skill.** From a Codex session in your project, the plugin's own suggested prompt is:
+**2. Use it.** Once installed, hand it a long job:
 
-   ```text
-   Use wake-run to launch this experiment and continue after it exits.
-   ```
+```text
+Use the wake-run skill to run xxx for me.
+```
 
-   Codex invokes the launcher for you. To run it directly instead, call it by absolute path while keeping your project as the working directory:
+Codex takes it from there: it finalizes the command, calls the launcher, and ends the turn as soon as it sees `status: armed`. When the job exits, the wake-up message brings the thread back and Codex continues.
 
-   ```bash
-   python3 /path/to/codex-wake-run/skills/wake-run/scripts/wake_run.py \
-     --command '<exact command>'
-   ```
+A few things worth knowing:
 
-   Use `python` rather than `python3` on Windows.
+- **It only works inside a Codex session.** The skill needs `CODEX_THREAD_ID` to know which thread to wake, and Codex injects that into shell command environments. Outside a session the launcher exits with `CODEX_THREAD_ID is missing; run wake-run from a Codex shell command.`
+- **Your Codex CLI needs `codex queue`.** The launcher preflights this with `codex queue --help` and refuses to start otherwise. Check it yourself the same way.
+- **It is not a way around your sandbox.** The background process inherits the launch environment and its permissions, so it cannot be used to bypass sandboxing, approvals, or command restrictions.
+- **One watcher per experiment.** Running several in parallel is fine when the task genuinely calls for it.
 
-3. **Read the JSON, then stop.** A `status` of `armed` means the watcher owns the job. End the turn. Do not tail the log, check the process, or sleep.
+To call the launcher directly instead of through the skill, invoke it by absolute path while keeping your project as the working directory:
 
-4. **Continue when the wake-up arrives.** The message beginning `[后台任务唤醒通知]` is a system-generated continuation event, not a new user instruction. Read the named log if you need detail, then resume the original task: analyze the result on success, or diagnose and relaunch on failure.
+```bash
+python3 /path/to/codex-wake-run/skills/wake-run/scripts/wake_run.py \
+  --command '<exact command>'
+```
 
-If `CODEX_THREAD_ID` is not set, the launcher exits with `CODEX_THREAD_ID is missing; run wake-run from a Codex shell command.` Codex injects that variable into shell command environments, so this error normally means the command was run outside a Codex session.
+Use `python` rather than `python3` on Windows.
 
 ## Launcher options
 
@@ -153,17 +151,6 @@ If `CODEX_THREAD_ID` is not set, the launcher exits with `CODEX_THREAD_ID is mis
 
 The detached watcher exits with the command's own exit code, `127` if the process could not be launched, or `70` if the command finished but `codex queue` failed. In that last case the reason is appended to the run log, since there is no thread left to report it to.
 
-## Runtime requirements
-
-- **A Codex session.** `CODEX_THREAD_ID` must be present in the environment; Codex provides it.
-- **A Codex CLI with `codex queue`.** Verified by preflight before your command runs.
-- **Python 3.** Standard library only. CI exercises the suite on Python 3.12.
-- **Windows notes.** Commands are interpreted by PowerShell, never wrapped in an extra `cmd.exe` layer, and a `codex.ps1` shim is invoked through PowerShell rather than passed to `CreateProcess`.
-
-Run one watcher per experiment. Parallel watchers are fine when the task genuinely calls for them.
-
-wake-run is not a way around your sandbox. The background process inherits the launch environment and its permissions, so do not use it to bypass sandboxing, approvals, or command restrictions.
-
 ## Repository layout
 
 | Path | What it holds |
@@ -176,15 +163,7 @@ wake-run is not a way around your sandbox. The background process inherits the l
 
 Run logs are written to `.codex-wake-run/` in whichever project you launch from, and that directory is gitignored.
 
-## Development
+## Acknowledgements
 
-```bash
-python -m unittest discover -s tests -v
-```
-
-The same command runs in CI on `ubuntu-latest` and `windows-latest` with Python 3.12, on every push and pull request. Windows-specific cases are skipped on POSIX hosts. The suite covers wake-up message content, PowerShell and `codex.ps1` invocation, thread targeting, the `codex queue` preflight, watcher success and failure paths, detached launch, and an assertion that the runtime contains no polling or sleep loop.
-
-## Community and support
-
-Questions and bug reports are welcome in [GitHub Issues](https://github.com/ZardLi1115/codex-wake-run/issues). Broader discussion happens on [Linux.do](https://linux.do/latest).
+Thanks to the [Linux.do](https://linux.do/latest) community for its support.
 
