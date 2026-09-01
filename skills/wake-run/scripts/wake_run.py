@@ -48,12 +48,85 @@ def build_wake_message(
     return "\n".join(lines)
 
 
-def preflight_codex_queue(codex_bin: str) -> None:
-    resolved = shutil.which(codex_bin)
-    if resolved is None:
-        raise RuntimeError(f"Codex CLI not found: {codex_bin}")
+def resolve_powershell() -> str:
+    for candidate in ("pwsh", "powershell.exe", "powershell"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise RuntimeError("PowerShell is required to run wake-run commands on Windows.")
+
+
+def resolve_codex_executable(codex_bin: str, *, platform: str | None = None) -> str:
+    platform = platform or os.name
+    candidate = Path(codex_bin).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
+
+    # PowerShell can resolve `codex` to codex.ps1. Python's CreateProcess cannot
+    # execute .ps1 directly, so on Windows prefer native/npm shims first.
+    if platform == "nt" and candidate.parent == Path(".") and not candidate.suffix:
+        for suffix in (".exe", ".cmd", ".bat", ".ps1", ""):
+            resolved = shutil.which(codex_bin + suffix)
+            if resolved:
+                return resolved
+    else:
+        resolved = shutil.which(codex_bin)
+        if resolved:
+            return resolved
+
+    raise RuntimeError(f"Codex CLI not found: {codex_bin}")
+
+
+def build_codex_invocation(
+    resolved_codex: str,
+    args: list[str],
+    *,
+    platform: str | None = None,
+    powershell_bin: str | None = None,
+) -> list[str]:
+    platform = platform or os.name
+    suffix = Path(resolved_codex).suffix.lower()
+    if platform == "nt" and suffix == ".ps1":
+        powershell_bin = powershell_bin or resolve_powershell()
+        return [
+            powershell_bin,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            resolved_codex,
+            *args,
+        ]
+    return [resolved_codex, *args]
+
+
+def build_experiment_invocation(
+    command: str,
+    *,
+    platform: str | None = None,
+    powershell_bin: str | None = None,
+) -> list[str]:
+    platform = platform or os.name
+    if platform == "nt":
+        powershell_bin = powershell_bin or resolve_powershell()
+        return [
+            powershell_bin,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ]
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    if not Path(shell).is_file():
+        shell = "/bin/sh"
+    return [shell, "-c", command]
+
+
+def preflight_codex_queue(codex_bin: str) -> str:
+    resolved = resolve_codex_executable(codex_bin)
     result = subprocess.run(
-        [resolved, "queue", "--help"],
+        build_codex_invocation(resolved, ["queue", "--help"]),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -61,11 +134,16 @@ def preflight_codex_queue(codex_bin: str) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError("This Codex CLI does not support `codex queue`.")
+    return resolved
 
 
 def queue_wakeup(thread_id: str, message: str, codex_bin: str) -> None:
+    resolved = resolve_codex_executable(codex_bin)
     result = subprocess.run(
-        [codex_bin, "queue", "--thread", thread_id, "--message", message],
+        build_codex_invocation(
+            resolved,
+            ["queue", "--thread", thread_id, "--message", message],
+        ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -93,9 +171,8 @@ def run_worker(
         log.write(f"$ {command}\n".encode("utf-8", errors="replace"))
         try:
             process = subprocess.Popen(
-                command,
+                build_experiment_invocation(command),
                 cwd=str(cwd),
-                shell=True,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -143,7 +220,7 @@ def arm_watcher(
     log_dir: Path,
     codex_bin: str,
 ) -> dict[str, object]:
-    preflight_codex_queue(codex_bin)
+    resolved_codex = preflight_codex_queue(codex_bin)
     run_id = uuid.uuid4().hex[:12]
     log_file = (log_dir / f"{run_id}.log").resolve()
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -161,7 +238,7 @@ def arm_watcher(
         "--log-file",
         str(log_file),
         "--codex-bin",
-        codex_bin,
+        resolved_codex,
     ]
     worker = subprocess.Popen(worker_args, **detached_popen_kwargs())
     return {
