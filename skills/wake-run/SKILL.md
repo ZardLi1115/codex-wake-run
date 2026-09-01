@@ -10,10 +10,10 @@ Run long commands without model polling. The bundled watcher waits on the operat
 ## Launch workflow
 
 1. Finalize the exact experiment command before launching it. Do not launch while important command arguments are still undecided.
-2. Invoke this Skill's `scripts/wake_run.py` by absolute path while keeping the user's project as the current working directory:
+2. Invoke this Skill's `scripts/wake_run.py` by absolute path while keeping the user's project as the current working directory. Use an available Python 3 interpreter (`python` on Windows is usually appropriate; `python3` is common on POSIX):
 
 ```bash
-python3 <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
+python <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 ```
 
 3. Read the launcher's JSON response.
@@ -31,6 +31,8 @@ python3 <skill-dir>/scripts/wake_run.py --command '<exact shell command>'
 
 - Require `CODEX_THREAD_ID`; Codex injects it into shell command environments.
 - Require a Codex CLI version that supports `codex queue`. The launcher verifies this before starting the experiment.
+- Interpret experiment commands with PowerShell on Windows and `/bin/sh` on POSIX. Do not wrap PowerShell commands in an additional `cmd.exe` layer.
+- Support Windows Codex shims, including `codex.ps1`; invoke `.ps1` shims through PowerShell rather than passing them directly to `CreateProcess`.
 - Store logs under `<cwd>/.codex-wake-run/` unless `--log-dir` is supplied.
 - Use one detached watcher per experiment. Parallel experiments are allowed only when the user's task actually calls for them.
 - Do not use wake-run to bypass sandboxing, approvals, or command restrictions. The background process inherits the launch environment and its permissions.
