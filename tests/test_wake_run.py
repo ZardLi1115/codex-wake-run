@@ -42,7 +42,7 @@ class WakeMessageTests(unittest.TestCase):
 
 
 class InvocationTests(unittest.TestCase):
-    def test_windows_experiment_uses_powershell_not_cmd(self) -> None:
+    def test_windows_experiment_uses_powershell_and_preserves_exit_code(self) -> None:
         invocation = wake_run.build_experiment_invocation(
             "& '.\\experiment.ps1'",
             platform="nt",
@@ -50,7 +50,8 @@ class InvocationTests(unittest.TestCase):
         )
         self.assertEqual(invocation[0], r"C:\Program Files\PowerShell\7\pwsh.exe")
         self.assertIn("-Command", invocation)
-        self.assertEqual(invocation[-1], "& '.\\experiment.ps1'")
+        self.assertIn("& { & '.\\experiment.ps1' }", invocation[-1])
+        self.assertIn("$LASTEXITCODE", invocation[-1])
         self.assertNotIn("cmd.exe", " ".join(invocation).lower())
 
     def test_windows_codex_ps1_is_wrapped_with_powershell(self) -> None:
@@ -62,14 +63,7 @@ class InvocationTests(unittest.TestCase):
         )
         self.assertEqual(
             invocation[:6],
-            [
-                "pwsh.exe",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-File",
-                r"C:\Users\me\AppData\Roaming\npm\codex.ps1",
-            ],
+            ["pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", r"C:\Users\me\AppData\Roaming\npm\codex.ps1"],
         )
         self.assertEqual(invocation[-1], "hello\nworld")
 
@@ -83,10 +77,7 @@ class InvocationTests(unittest.TestCase):
             "codex": r"C:\npm\codex.ps1",
         }
         which.side_effect = lambda name: candidates.get(name)
-        self.assertEqual(
-            wake_run.resolve_codex_executable("codex", platform="nt"),
-            r"C:\npm\codex.cmd",
-        )
+        self.assertEqual(wake_run.resolve_codex_executable("codex", platform="nt"), r"C:\npm\codex.cmd")
 
 
 class QueueTests(unittest.TestCase):
@@ -95,10 +86,7 @@ class QueueTests(unittest.TestCase):
     def test_queue_wakeup_uses_originating_thread(self, run: mock.Mock, _resolve: mock.Mock) -> None:
         run.return_value = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
         wake_run.queue_wakeup("thread-123", "wake message", "codex")
-        self.assertEqual(
-            run.call_args.args[0],
-            ["/usr/bin/codex", "queue", "--thread", "thread-123", "--message", "wake message"],
-        )
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/codex", "queue", "--thread", "thread-123", "--message", "wake message"])
 
     @mock.patch.object(wake_run, "resolve_codex_executable", return_value="/usr/bin/codex")
     @mock.patch.object(wake_run.subprocess, "run")
@@ -132,11 +120,10 @@ class WorkerTests(unittest.TestCase):
     def test_worker_waits_for_success_and_queues_wakeup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "success.log"
-            command = python_shell_command("print(12345)")
             with mock.patch.object(wake_run, "queue_wakeup") as queue:
                 exit_code = wake_run.run_worker(
                     thread_id="thread-success",
-                    command=command,
+                    command=python_shell_command("print(12345)"),
                     cwd=Path(tmp),
                     log_file=log_file,
                     codex_bin="codex",
@@ -148,11 +135,10 @@ class WorkerTests(unittest.TestCase):
     def test_worker_waits_for_failure_and_queues_wakeup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "failure.log"
-            command = python_shell_command("import sys; print(67890); sys.exit(9)")
             with mock.patch.object(wake_run, "queue_wakeup") as queue:
                 exit_code = wake_run.run_worker(
                     thread_id="thread-failure",
-                    command=command,
+                    command=python_shell_command("import sys; print(67890); sys.exit(9)"),
                     cwd=Path(tmp),
                     log_file=log_file,
                     codex_bin="codex",
@@ -160,6 +146,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(exit_code, 9)
             self.assertIn("67890", log_file.read_text(encoding="utf-8"))
             self.assertIn("状态：执行失败", queue.call_args.args[1])
+            self.assertIn("退出码：9", queue.call_args.args[1])
 
     def test_runtime_source_has_no_poll_or_sleep_loop(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -175,29 +162,13 @@ class WorkerTests(unittest.TestCase):
             capture = tmp_path / "queue-args.txt"
             fake_codex = tmp_path / "codex"
             fake_codex.write_text(
-                f"#!{sys.executable}\n"
-                "import json, sys\n"
-                f"open({str(capture)!r}, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:], ensure_ascii=False))\n",
+                f"#!{sys.executable}\nimport json, sys\nopen({str(capture)!r}, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:], ensure_ascii=False))\n",
                 encoding="utf-8",
             )
             fake_codex.chmod(0o755)
             log_file = tmp_path / "integration.log"
             result = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPT),
-                    "--worker",
-                    "--thread-id",
-                    "thread-integration",
-                    "--command",
-                    python_shell_command("print(24680)"),
-                    "--cwd",
-                    str(tmp_path),
-                    "--log-file",
-                    str(log_file),
-                    "--codex-bin",
-                    str(fake_codex),
-                ],
+                [sys.executable, str(SCRIPT), "--worker", "--thread-id", "thread-integration", "--command", python_shell_command("print(24680)"), "--cwd", str(tmp_path), "--log-file", str(log_file), "--codex-bin", str(fake_codex)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -233,13 +204,7 @@ class LauncherTests(unittest.TestCase):
     def test_launcher_detaches_worker_and_returns_armed(self, popen: mock.Mock, _preflight: mock.Mock) -> None:
         popen.return_value.pid = 4242
         with tempfile.TemporaryDirectory() as tmp:
-            result = wake_run.arm_watcher(
-                thread_id="thread-abc",
-                command="python train.py",
-                cwd=Path(tmp),
-                log_dir=Path(tmp) / "logs",
-                codex_bin="codex",
-            )
+            result = wake_run.arm_watcher(thread_id="thread-abc", command="python train.py", cwd=Path(tmp), log_dir=Path(tmp) / "logs", codex_bin="codex")
         self.assertEqual(result["status"], "armed")
         self.assertEqual(result["worker_pid"], 4242)
         self.assertIn("/resolved/codex", popen.call_args.args[0])
