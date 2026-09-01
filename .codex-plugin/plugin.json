@@ -1,6 +1,6 @@
 {
   "name": "codex-wake-run",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run long-lived commands in a detached watcher and wake the originating Codex thread when they exit.",
   "author": {
     "name": "ZardLi1115",
